@@ -120,6 +120,31 @@ impl From<DeepSeekOutputError> for Unsupported {
 }
 
 impl ChatModel {
+    /// `get_context_length` over the model's `config.json`.
+    pub fn config_context_length(config: &Value) -> u64 {
+        let config = config.get("text_config").unwrap_or(config);
+        let scaling = &config["rope_scaling"];
+        let factor = match scaling.as_object() {
+            Some(s)
+                if !s.contains_key("original_max_position_embeddings")
+                    && s.get("rope_type").and_then(|t| t.as_str()) != Some("llama3") =>
+            {
+                s.get("factor").and_then(|f| f.as_f64()).unwrap_or(1.0)
+            }
+            _ => 1.0,
+        };
+        [
+            "max_sequence_length",
+            "seq_length",
+            "max_seq_len",
+            "model_max_length",
+            "max_position_embeddings",
+        ]
+        .iter()
+        .find_map(|key| config[*key].as_f64())
+        .map_or(2048, |len| (factor * len) as u64)
+    }
+
     /// What `template_detection` and `chat_encoding_spec` resolve for
     /// `formatter`; the host fills in the rest.
     #[cfg(feature = "render")]

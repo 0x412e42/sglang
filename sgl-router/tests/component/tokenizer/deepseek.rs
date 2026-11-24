@@ -56,7 +56,7 @@ fn tokenizer_with_l1(
 
 /// The tokenizer as the router hands it to chat encodes.
 fn sglang(tokenizer: &dynamo_tokenizers::Tokenizer) -> SglangTokenizer {
-    SglangTokenizer::new(tokenizer.clone(), "tokenizer.json")
+    SglangTokenizer::new(tokenizer.clone()).with_tokenizer_file("tokenizer.json")
 }
 
 /// A conversation that grows by one exchange per turn, each message long

@@ -2,8 +2,8 @@
 //! executor). Each worker pulls a `Request` from the shared `flume` receiver,
 //! fills `input_ids`, and moves the request back to the TokenizerManager inbox.
 //!
-//! The text→ids step is `sglang_processor`'s [`TextTokenizer`], implemented by
-//! [`SglangTokenizer`] (dynamo-tokenizers: HuggingFace / tiktoken / fastokens).
+//! The text→ids step is `sglang_processor`'s [`SglangTokenizer`]
+//! (dynamo-tokenizers: HuggingFace / tiktoken / fastokens).
 //! A non-skip server requires a real tokenizer (enforced at startup); under
 //! `skip_tokenizer_init` the pool isn't spawned at all.
 //!
@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use sglang_processor::{ProcessorError, SglangTokenizer, TextTokenizer};
+use sglang_processor::{ProcessorError, SglangTokenizer};
 
 use crate::message::request::{Request, RequestKind, TokenizeInput};
 use crate::message::response::ResponseItem;
@@ -43,7 +43,7 @@ pub fn load_tokenizer(
 
 /// Widened once here, in the parallel pool: the scheduler's `array("q")` is
 /// int64, and the ids move into their ring buffer untouched from here.
-fn widen(encoded: Result<Vec<i32>, ProcessorError>) -> Result<TokenIds, Error> {
+fn widen(encoded: Result<Vec<u32>, ProcessorError>) -> Result<TokenIds, Error> {
     match encoded {
         Ok(ids) => Ok(ids.into_iter().map(i64::from).collect()),
         Err(ProcessorError::Tokenize(message)) => Err(Error::Tokenize(message)),
@@ -56,14 +56,14 @@ fn widen(encoded: Result<Vec<i32>, ProcessorError>) -> Result<TokenIds, Error> {
 pub struct TokenizerWorker {
     rx: flume::Receiver<Request>,
     tm: flume::Sender<TmEvent>,
-    tokenizer: Arc<dyn TextTokenizer>,
+    tokenizer: Arc<SglangTokenizer>,
 }
 
 impl TokenizerWorker {
     pub fn new(
         rx: flume::Receiver<Request>,
         tm: flume::Sender<TmEvent>,
-        tokenizer: Arc<dyn TextTokenizer>,
+        tokenizer: Arc<SglangTokenizer>,
     ) -> Self {
         Self { rx, tm, tokenizer }
     }
@@ -80,7 +80,7 @@ impl Runnable for TokenizerWorker {
                         text,
                         add_special_tokens,
                     } => widen(self.tokenizer.encode(text, *add_special_tokens)),
-                    TokenizeInput::Chat(chat) => widen(chat.encode(&*self.tokenizer)),
+                    TokenizeInput::Chat(chat) => widen(chat.encode(&self.tokenizer)),
                 };
                 let item = match encoded {
                     Ok(ids) => ResponseItem::TokenIds(ids),
@@ -115,7 +115,7 @@ impl Runnable for TokenizerWorker {
                     g.sampling_params.stop_str_max_len = n;
                 }
                 let encoded = match g.chat_prompt.take() {
-                    Some(chat) => widen(chat.encode(&*self.tokenizer)),
+                    Some(chat) => widen(chat.encode(&self.tokenizer)),
                     // As Python, an empty prompt is a 400, not a tokenize error's 500.
                     None => match g.text.as_deref().unwrap_or("") {
                         "" => Err(Error::Validation("prompt cannot be empty".into())),
@@ -151,16 +151,44 @@ mod tests {
     use crate::message::response::ResponseSink;
     use crate::message::sampling::SamplingParams;
     use crate::utils::fsm::{AfterTokenize, RequestState};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use serde_json::json;
+    use sglang_processor::PromptAffixes;
     use sglang_processor::dynamo_renderer::RenderedPrompt;
+    use sglang_processor::dynamo_tokenizers::Tokenizer;
     use tokio::sync::mpsc;
 
-    /// One token per whitespace-separated word, so a stop's token count differs
-    /// from its byte count and the two units cannot be confused.
-    struct WordTokenizer;
-    impl TextTokenizer for WordTokenizer {
-        fn encode(&self, text: &str, _: bool) -> Result<Vec<i32>, ProcessorError> {
-            Ok(text.split_whitespace().map(|_| 1).collect())
-        }
+    /// One id per whitespace-separated word, so a stop's token count differs from
+    /// its byte count; `hi` is 2 and `abc` 3, and specials prepend the `<s>` BOS (0),
+    /// like an HF tokenizer whose post-processor adds one.
+    fn word_tokenizer() -> Arc<SglangTokenizer> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let bos = json!({"id": 0, "content": "<s>", "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": false, "special": true});
+        let tokenizer_json = json!({
+            "added_tokens": [bos],
+            "pre_tokenizer": {"type": "Whitespace"},
+            "model": {"type": "WordLevel", "unk_token": "[UNK]",
+                "vocab": {"<s>": 0, "[UNK]": 1, "hi": 2, "abc": 3}},
+        });
+        let file = std::env::temp_dir().join(format!(
+            "sglang-server-words-{}-{}.json",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&file, tokenizer_json.to_string()).unwrap();
+        let inner = Tokenizer::from_file(file.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&file).ok();
+        let affixes = PromptAffixes {
+            prefix: vec![0],
+            ..Default::default()
+        };
+        Arc::new(
+            SglangTokenizer::new(inner)
+                .with_bos_token(&json!({"bos_token": "<s>"}))
+                .with_prompt_affixes(affixes),
+        )
     }
 
     /// The scheduler's stop-match window must reach the wire as a TOKEN count, as
@@ -175,7 +203,7 @@ mod tests {
         let (req_tx, req_rx) = flume::unbounded::<Request>();
         let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
 
-        // 8 bytes vs 3 "tokens" under WordTokenizer — units are distinguishable.
+        // 8 bytes vs 3 words — units are distinguishable.
         let sp = SamplingParams {
             stop_strs: vec!["a bb ccc".to_string(), "dd".to_string()],
             stop_str_max_len: 8, // what `normalize_stops` left: max BYTE length
@@ -199,7 +227,7 @@ mod tests {
             .expect("send");
         drop(req_tx); // closes the loop after one request
 
-        TokenizerWorker::new(req_rx, tm_tx, Arc::new(WordTokenizer)).run();
+        TokenizerWorker::new(req_rx, tm_tx, word_tokenizer()).run();
 
         let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned") else {
             panic!("expected Tokenized");
@@ -235,7 +263,7 @@ mod tests {
             .expect("send");
         drop(req_tx);
 
-        TokenizerWorker::new(req_rx, tm_tx, Arc::new(WordTokenizer)).run();
+        TokenizerWorker::new(req_rx, tm_tx, word_tokenizer()).run();
 
         let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned, not dropped") else {
             panic!("expected Tokenized");
@@ -246,20 +274,6 @@ mod tests {
             "{:?}",
             req.state
         );
-    }
-
-    /// One id per text (its length), after a BOS (id 0) when specials are
-    /// added — like an HF tokenizer whose post-processor prepends one.
-    struct MarkedTokenizer;
-    impl TextTokenizer for MarkedTokenizer {
-        fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, ProcessorError> {
-            let bos = add_special_tokens.then_some(0);
-            let text = (!text.is_empty()).then_some(text.len() as i32);
-            Ok(bos.into_iter().chain(text).collect())
-        }
-        fn bos_token_id(&self) -> Option<i32> {
-            Some(0)
-        }
     }
 
     /// Plain text keeps the tokenizer's specials; a rendered chat encodes without
@@ -285,7 +299,7 @@ mod tests {
                 })
                 .expect("send");
             drop(req_tx);
-            TokenizerWorker::new(req_rx, tm_tx, Arc::new(MarkedTokenizer)).run();
+            TokenizerWorker::new(req_rx, tm_tx, word_tokenizer()).run();
             let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned") else {
                 panic!("expected Tokenized");
             };
@@ -329,7 +343,7 @@ mod tests {
                 })
                 .expect("send");
             drop(req_tx);
-            TokenizerWorker::new(req_rx, tm_tx, Arc::new(MarkedTokenizer)).run();
+            TokenizerWorker::new(req_rx, tm_tx, word_tokenizer()).run();
             assert!(tm_rx.try_recv().is_err(), "answered here, not by intake");
             match sink_rx.try_recv() {
                 Ok(ResponseItem::TokenIds(ids)) => ids,

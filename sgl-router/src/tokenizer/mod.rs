@@ -151,31 +151,6 @@ fn media_token_ids(tokenizer_json: &serde_json::Value) -> Vec<u32> {
         .collect()
 }
 
-/// `get_context_length` over the model's text config.
-fn context_length(config: &serde_json::Value) -> u64 {
-    let config = config.get("text_config").unwrap_or(config);
-    let scaling = &config["rope_scaling"];
-    let factor = match scaling.as_object() {
-        Some(s)
-            if !s.contains_key("original_max_position_embeddings")
-                && s.get("rope_type").and_then(|t| t.as_str()) != Some("llama3") =>
-        {
-            s.get("factor").and_then(|f| f.as_f64()).unwrap_or(1.0)
-        }
-        _ => 1.0,
-    };
-    [
-        "max_sequence_length",
-        "seq_length",
-        "max_seq_len",
-        "model_max_length",
-        "max_position_embeddings",
-    ]
-    .iter()
-    .find_map(|key| config[*key].as_f64())
-    .map_or(2048, |len| (factor * len) as u64)
-}
-
 impl std::fmt::Debug for TokenizerRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenizerRegistry")
@@ -207,7 +182,7 @@ impl TokenizerRegistry {
                 .json("config.json")
                 .ok()
                 .flatten()
-                .map(|config| context_length(&config)),
+                .map(|config| ChatModel::config_context_length(&config)),
             generation_config: files
                 .json("generation_config.json")
                 .ok()

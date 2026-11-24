@@ -47,18 +47,9 @@ when `tokenizer_config.json` names a tiktoken class, then falls back to
 ## tokenizer
 
 ```rust
-load_tokenizer(path, revision, add_special_tokens) -> Result<dynamo_tokenizers::Tokenizer, String>
-DynamoTokenizer::new(without_specials, with_specials)
-trait TextTokenizer { encode(text, add_special_tokens), encode_segments(segments, add_special_tokens) }
-```
-
-Pass-through, used by `sglang-server`. `load_tokenizer` calls
-`Tokenizer::from_file_with_options`, and `encode` / `encode_segments` call the
-Dynamo tokenizer. Dynamo fixes `add_special_tokens` at load time, so
-`DynamoTokenizer` holds one handle per setting and picks one per request.
-
-```rust
-SglangTokenizer::new(dynamo_tokenizer, tokenizer_file)
+SglangTokenizer::load(path, revision) -> Result<SglangTokenizer, String>
+SglangTokenizer::new(dynamo_tokenizer)
+    .with_tokenizer_file(tokenizer_file)
     .with_prompt_affixes(PromptAffixes::derive(tokenizer_file, &tokenizer_config, &model_config)?)
     .with_bos_token(&tokenizer_config)
     .with_token_pieces(&tokenizer_json)
@@ -66,10 +57,13 @@ tokenizer.encode(text, add_special_tokens) / encode_prompt(text) / encode_segmen
 tokenizer.encode_chat(prompt_segments, continuation) / decode(ids, skip_special_tokens) / byte_level_bytes(id)
 ```
 
-SGLang-specific, used by sgl-router. The host builds the Dynamo backend (its
-own encoder or cache) loaded without special tokens, and reads the checkpoint's
-configs; `SglangTokenizer` adds what transformers and SGLang's tokenizer
-manager do on top of it:
+Used by `sglang-server` and sgl-router. `load` resolves the files like
+`resolve_tokenizer_file` and, where `derive` refuses, falls back to
+`PromptAffixes::from_post_processor` with a warning, since a server has no
+engine to defer to. The router builds the Dynamo backend itself (its own
+encoder or cache), loaded without special tokens, and chains the builders.
+`SglangTokenizer` adds what transformers and SGLang's tokenizer manager do on
+top of the backend:
 
 - `PromptAffixes`: the special tokens `tokenizer(text)` adds. BOS follows
   `add_bos_token` for the classes `_fix_v5_add_bos_eos_token` restores, and the

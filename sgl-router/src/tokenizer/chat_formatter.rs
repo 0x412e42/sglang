@@ -1466,7 +1466,9 @@ mod tests {
         let raw = super::super::adapter::load(file).unwrap();
         // SGLang drops `tokenizer.bos_token_id`, which `tokenizer_config.json` names.
         let bos_config = json!({"bos_token": "<|endoftext|>"});
-        let tokenizer = SglangTokenizer::new((*raw).clone(), file).with_bos_token(&bos_config);
+        let tokenizer = SglangTokenizer::new((*raw).clone())
+            .with_tokenizer_file(file)
+            .with_bos_token(&bos_config);
         let formatter = jinja(json!({"chat_template":"a", "bos_token":"<|endoftext|>"}));
         let mut req = request(json!([
             {"role":"user","content":"hi"}, {"role":"assistant","content":"b"}
@@ -1482,7 +1484,8 @@ mod tests {
         // A tokenizer that adds BOS itself keeps the prefix's own: SGLang encodes
         // `[BOS, BOS, b]` and drops only the first.
         let bos = super::super::adapter::encode(&raw, "<|endoftext|>").unwrap();
-        let auto_bos = SglangTokenizer::new((*raw).clone(), file)
+        let auto_bos = SglangTokenizer::new((*raw).clone())
+            .with_tokenizer_file(file)
             .with_bos_token(&bos_config)
             .with_prompt_affixes(super::super::adapter::PromptAffixes {
                 prefix: bos.clone(),

@@ -272,7 +272,6 @@ impl SglangTokenizer {
 
     /// Tiktoken has no vocab lookup, so the token is encoded as a special,
     /// which must give one id.
-    /// Tiktoken has no vocab lookup, so the token must encode to one id.
     fn token_id(&self, token: &str) -> Option<u32> {
         if let Ok(Some(id)) = self.inner.token_to_id(token) {
             return Some(id);
@@ -430,38 +429,6 @@ fn kimi_chunks<'a>(segment: &EncodeSegment<'a>) -> Vec<EncodeSegment<'a>> {
     }
     chunks.push(EncodeSegment::new(&text[start..], segment.allow_special));
     chunks
-}
-
-/// Lets `sglang-server`'s tokenizer pool run on this type unchanged.
-impl super::TextTokenizer for SglangTokenizer {
-    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, Error> {
-        SglangTokenizer::encode(self, text, add_special_tokens).map(widen)
-    }
-
-    fn bos_token_id(&self) -> Option<i32> {
-        self.bos.and_then(|id| i32::try_from(id).ok())
-    }
-
-    fn encode_chat(
-        &self,
-        prompt: &[EncodeSegment<'_>],
-        continuation: &str,
-    ) -> Result<Vec<i32>, Error> {
-        SglangTokenizer::encode_chat(self, prompt, continuation).map(widen)
-    }
-
-    fn encode_segments(
-        &self,
-        segments: &[EncodeSegment<'_>],
-        add_special_tokens: bool,
-    ) -> Result<Vec<i32>, Error> {
-        SglangTokenizer::encode_segments(self, segments, add_special_tokens).map(widen)
-    }
-}
-
-/// Vocab ids are non-negative and fit in i32.
-fn widen(ids: Vec<u32>) -> Vec<i32> {
-    ids.into_iter().map(|id| id as i32).collect()
 }
 
 #[cfg(feature = "openai")]
@@ -685,21 +652,35 @@ mod tests {
         );
     }
 
+    /// With a configured, auto-added `<s>`, the template encodes without it and the
+    /// continuation loses one leading BOS, as on Python.
     #[test]
-    fn special_tokens_wrap_a_segmented_prompt_once() {
-        let (_dir, tokenizer) = tiny(
-            "segments-once",
-            PromptAffixes {
-                prefix: vec![256],
-                suffix: vec![256],
-                eos: None,
-            },
-        );
-        let segments = [EncodeSegment::control("a"), EncodeSegment::control("b")];
-        let bare = tokenizer.encode_segments(&segments, false).unwrap();
-        assert_eq!(
-            tokenizer.encode_segments(&segments, true).unwrap(),
-            [&[256], bare.as_slice(), &[256]].concat()
-        );
+    fn chat_encode_drops_one_configured_bos() {
+        let dir = std::env::temp_dir().join(format!("processor-bos-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tokenizer = json!({
+            "added_tokens": [{"id": 0, "content": "<s>", "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true}],
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": {"type": "TemplateProcessing",
+                "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}}],
+                "pair": [{"Sequence": {"id": "A", "type_id": 0}}],
+                "special_tokens": {"<s>": {"id": "<s>", "ids": [0], "tokens": ["<s>"]}}},
+            "model": {"type": "WordLevel", "unk_token": "[UNK]",
+                "vocab": {"<s>": 0, "[UNK]": 1, "Hi": 2, "It": 3}},
+        });
+        let file = dir.join("tokenizer.json");
+        std::fs::write(&file, tokenizer.to_string()).unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), r#"{"bos_token": "<s>"}"#).unwrap();
+        let tokenizer = SglangTokenizer::load(file.to_str().unwrap(), None).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(tokenizer.bos_token_id(), Some(0));
+
+        let prompt = [EncodeSegment::control("Hi")];
+        let encode_chat = |continuation| tokenizer.encode_chat(&prompt, continuation);
+        assert_eq!(encode_chat("It").unwrap(), vec![2, 3]);
+        // Only one BOS is dropped, as Python's: the auto-added one here.
+        assert_eq!(encode_chat("<s><s>It").unwrap(), vec![2, 0, 0, 3]);
     }
 }

@@ -112,8 +112,7 @@ impl OpenAiChat {
             continuation,
             ids: None,
         };
-        let ids = rendered.encode(&*self.tokenizer).ok()?;
-        Some(ids.into_iter().map(|id| id as u32).collect())
+        rendered.encode(&self.tokenizer).ok()
     }
 }
 

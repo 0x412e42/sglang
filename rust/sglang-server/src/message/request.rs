@@ -639,10 +639,10 @@ impl RenderedChat {
     /// Python's chat encode, through the processor's tokenizer.
     pub fn encode(
         &self,
-        tokenizer: &dyn sglang_processor::TextTokenizer,
-    ) -> Result<Vec<i32>, sglang_processor::ProcessorError> {
+        tokenizer: &sglang_processor::SglangTokenizer,
+    ) -> Result<Vec<u32>, sglang_processor::ProcessorError> {
         if let Some(ids) = &self.ids {
-            return Ok(ids.iter().map(|&id| id as i32).collect());
+            return Ok(ids.clone());
         }
         let segments = self.prompt.encode_segments().unwrap_or_else(|| {
             vec![sglang_processor::dynamo_tokenizers::EncodeSegment::new(
