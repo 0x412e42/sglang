@@ -435,7 +435,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         skip_tokenizer_init,
     )?
     .map(Arc::new);
-    let dyn_tokenizer = tokenizer.as_ref().map(|t| t.tokenizer().clone());
+    let dyn_tokenizer = tokenizer.as_ref().map(|t| t.dynamo().clone());
     // Default: a real tokenizer decodes to text, with byte tables when they pass
     // their startup check, which is slow too, so it also runs before the ports
     // are bound. `None` (→ `Skip`, raw `output_ids`) only happens under

@@ -12,12 +12,11 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
-use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
 use sglang_processor::openai::{
     ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, ROUTING_KEY_HEADER,
-    Reply, TokenPieces, lower_chat,
+    Reply, lower_chat,
 };
-use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
+use sglang_processor::{SglangTokenizer, TemplateArgs, TemplateError};
 
 use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
@@ -37,34 +36,14 @@ use crate::utils::error::Error;
 pub struct OpenAiChat {
     settings: OpenAiSettings,
     model: ChatModel,
-    tokenizer: Arc<DynamoTokenizer>,
-    /// Token text and bytes for logprobs.
-    pieces: Arc<dyn OpenAiTokenizer>,
-}
-
-struct LogprobPieces {
-    tokenizer: Tokenizer,
-    /// `None` for a tokenizer without `tokenizer.json` (tiktoken).
-    pieces: Option<TokenPieces>,
-}
-
-impl OpenAiTokenizer for LogprobPieces {
-    fn decode(&self, ids: &[u32]) -> Option<String> {
-        match self.tokenizer.decode(ids, true).ok()? {
-            DecodeResult::Complete(text) | DecodeResult::Partial(text) => Some(text),
-        }
-    }
-
-    fn byte_level_bytes(&self, id: u32) -> Option<Vec<u8>> {
-        self.pieces.as_ref()?.byte_level_bytes(id)
-    }
+    tokenizer: Arc<SglangTokenizer>,
 }
 
 impl OpenAiChat {
     pub fn new(
         server_args: &ServerArgs,
         formatter: &ChatFormatter,
-        tokenizer: Arc<DynamoTokenizer>,
+        tokenizer: Arc<SglangTokenizer>,
     ) -> Self {
         let defaults = &server_args.model_config.default_sampling_params;
         let generation_config: Map<String, Value> = [
@@ -80,19 +59,6 @@ impl OpenAiChat {
         .into_iter()
         .filter_map(|(key, value)| Some((key.to_owned(), value?)))
         .collect();
-        let revision = server_args.revision.as_deref();
-        let pieces = sglang_processor::resolve_model_file(
-            &server_args.tokenizer_path,
-            revision,
-            "tokenizer.json",
-        )
-        .and_then(|file| std::fs::read(file).ok())
-        .and_then(|json| serde_json::from_slice(&json).ok())
-        .map(|json| TokenPieces::from_tokenizer_json(&json));
-        let pieces = Arc::new(LogprobPieces {
-            tokenizer: tokenizer.tokenizer().clone(),
-            pieces,
-        });
         Self {
             settings: OpenAiSettings {
                 allow_auto_truncate: server_args.allow_auto_truncate,
@@ -118,7 +84,6 @@ impl OpenAiChat {
                 ..ChatModel::for_formatter(formatter)
             },
             tokenizer,
-            pieces,
         }
     }
 
@@ -339,7 +304,7 @@ async fn lower(
             &openai.settings,
             &openai.model,
             render,
-            Some(openai.pieces.clone()),
+            Some(Arc::clone(&openai.tokenizer) as Arc<dyn OpenAiTokenizer>),
         )
         .ok()
     })
@@ -471,6 +436,7 @@ mod tests {
     use serde_json::json;
 
     use axum::Router;
+    use sglang_processor::dynamo_tokenizers::Tokenizer;
 
     use super::super::test_utils::{
         answering_app_state_with, answering_app_state_with_item, body_json, checkpoint_formatter,

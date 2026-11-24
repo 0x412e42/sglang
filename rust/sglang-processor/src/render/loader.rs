@@ -481,7 +481,7 @@ mod tests {
     fn harmony_request_text_encodes_like_the_whole_prompt() {
         use dynamo_tokenizers::EncodeSegment;
 
-        use crate::tokenizer::{DynamoTokenizer, TextTokenizer};
+        use crate::tokenizer::SglangTokenizer;
 
         let special = |id: u32, content: &str| {
             serde_json::json!({
@@ -503,7 +503,7 @@ mod tests {
         });
         std::fs::write(&file, tokenizer.to_string()).unwrap();
         std::fs::write(dir.join("tokenizer_config.json"), "{}").unwrap();
-        let tokenizer = DynamoTokenizer::load(file.to_str().unwrap(), None).unwrap();
+        let tokenizer = SglangTokenizer::load(file.to_str().unwrap(), None).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
         let formatter = ChatFormatter::from_tokenizer_config(&serde_json::json!({

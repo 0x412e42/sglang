@@ -11,37 +11,19 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
-use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
+use sglang_processor::dynamo_tokenizers::EncodeSegment;
 use sglang_processor::openai::{
-    ChatModel, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Responder, TokenPieces, lower_chat,
+    ChatModel, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Responder, lower_chat,
     lower_completion,
 };
 use sglang_processor::{
-    ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_model_file, select_chat_formatter,
+    ChatFormatter, ChatFormatterOptions, SglangTokenizer, resolve_model_file, select_chat_formatter,
 };
-
-struct FixtureTokenizer {
-    tokenizer: Tokenizer,
-    pieces: TokenPieces,
-}
-
-impl OpenAiTokenizer for FixtureTokenizer {
-    fn decode(&self, ids: &[u32]) -> Option<String> {
-        match self.tokenizer.decode(ids, true).ok()? {
-            DecodeResult::Complete(text) | DecodeResult::Partial(text) => Some(text),
-        }
-    }
-
-    fn byte_level_bytes(&self, id: u32) -> Option<Vec<u8>> {
-        self.pieces.byte_level_bytes(id)
-    }
-}
 
 /// The cached checkpoint's renderer and tokenizer, as a host has them.
 struct Checkpoint {
     formatter: ChatFormatter,
-    tokenizer: Tokenizer,
-    openai: Arc<dyn OpenAiTokenizer>,
+    tokenizer: Arc<SglangTokenizer>,
 }
 
 impl Checkpoint {
@@ -51,20 +33,14 @@ impl Checkpoint {
             tokenizer_path: dir.to_string_lossy().into_owned(),
             ..Default::default()
         });
-        let json = std::fs::read_to_string(tokenizer_file).unwrap();
         Self {
             formatter: formatter.unwrap_or_else(|| panic!("{error:?}")),
-            tokenizer: load_tokenizer(Some(tokenizer_file), None, true).unwrap(),
-            openai: Arc::new(FixtureTokenizer {
-                tokenizer: load_tokenizer(Some(tokenizer_file), None, false).unwrap(),
-                pieces: TokenPieces::from_tokenizer_json(&serde_json::from_str(&json).unwrap()),
-            }),
+            tokenizer: Arc::new(SglangTokenizer::load(tokenizer_file, None).unwrap()),
         }
     }
 
     /// The prompt ids SGLang encodes: the formatter's own ids when it encodes
-    /// requests, else the rendered prompt, then the `continue_final_message`
-    /// prefix without its BOS.
+    /// requests, else the rendered prompt and its `continue_final_message` prefix.
     fn render(&self, request: &Value, settings: &OpenAiSettings) -> Option<Vec<u32>> {
         let defaults: HashMap<String, Value> = settings
             .default_chat_template_kwargs
@@ -79,15 +55,10 @@ impl Checkpoint {
             .formatter
             .render_request(request.clone(), &defaults)
             .ok()?;
-        let ids = |text: &str| self.tokenizer.encode(text).unwrap().token_ids().to_vec();
-        let bos = ids("").first().copied();
-        let mut out = ids(prompt.as_str());
-        let mut suffix = ids(&prefix);
-        if bos.is_some() && suffix.first().copied() == bos {
-            suffix.remove(0);
-        }
-        out.extend(suffix);
-        Some(out)
+        let segments = prompt
+            .encode_segments()
+            .unwrap_or_else(|| vec![EncodeSegment::control(prompt.as_str())]);
+        self.tokenizer.encode_chat(&segments, &prefix).ok()
     }
 }
 
@@ -136,7 +107,7 @@ fn check_case(
         sglext_ids: false,
     };
     let body = serde_json::to_vec(&case["request"]).unwrap();
-    let tokenizer = checkpoint.map(|c| c.openai.clone());
+    let tokenizer = checkpoint.map(|c| Arc::clone(&c.tokenizer) as Arc<dyn OpenAiTokenizer>);
     let lowered = match case["endpoint"].as_str() {
         Some("chat") => {
             let recorded = || serde_json::from_value(case["generate"]["input_ids"].clone()).ok();

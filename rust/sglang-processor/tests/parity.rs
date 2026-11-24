@@ -9,10 +9,9 @@ use std::path::Path;
 
 use serde_json::Value;
 use sglang_processor::dynamo_renderer::RenderedPrompt;
-use sglang_processor::dynamo_tokenizers::Tokenizer;
+use sglang_processor::dynamo_tokenizers::EncodeSegment;
 use sglang_processor::{
-    ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_tokenizer_file,
-    select_chat_formatter,
+    ChatFormatter, ChatFormatterOptions, SglangTokenizer, select_chat_formatter,
 };
 use sha2::{Digest, Sha256};
 
@@ -36,9 +35,16 @@ fn check(fixture: &Value) {
     let model = fixture["model"].as_str().unwrap();
     let revision = fixture["revision"].as_str().unwrap();
     let default_formatter = formatter(model, fixture);
-    let tokenizers = cached_tokenizers(model, revision);
+    let tokenizer = cached_tokenizer(model, revision);
+    if let Some(tokenizer) = &tokenizer {
+        assert_eq!(
+            serde_json::json!(tokenizer.bos_token_id()),
+            fixture["bos_token_id"],
+            "{model}: bos_token_id"
+        );
+    }
     // Formatters that encode their own prompts (DeepSeek) need the checkpoint's tokenizer.
-    let encoder = tokenizers.as_ref().and_then(|_| {
+    let encoder = tokenizer.as_ref().and_then(|_| {
         select_chat_formatter(&ChatFormatterOptions {
             tokenizer_path: model.into(),
             revision: Some(revision.into()),
@@ -55,9 +61,8 @@ fn check(fixture: &Value) {
         });
         let outcome = check_case(
             override_formatter.as_ref().unwrap_or(&default_formatter),
-            tokenizers.as_ref(),
+            tokenizer.as_ref(),
             encoder.as_ref(),
-            &fixture["bos_token_id"],
             case,
         );
         // `known_gap` marks a divergence the processor cannot fix itself, such as one
@@ -73,9 +78,8 @@ fn check(fixture: &Value) {
 
 fn check_case(
     formatter: &ChatFormatter,
-    tokenizers: Option<&Tokenizers>,
+    tokenizer: Option<&SglangTokenizer>,
     encoder: Option<&ChatFormatter>,
-    bos: &Value,
     case: &Value,
 ) -> Result<(), String> {
     let defaults: HashMap<String, Value> = (case["default_chat_template_kwargs"].as_object())
@@ -93,14 +97,14 @@ fn check_case(
     if text != case["prompt"] {
         return Err(format!("prompt differs: {text}"));
     }
-    let Some(tokenizers) = tokenizers else {
+    let Some(tokenizer) = tokenizer else {
         return Ok(());
     };
     let ids = match encoder
         .and_then(|encoder| encoder.encode_request(case["request"].clone(), &defaults))
     {
         Some(ids) => ids.map_err(|error| error.to_string())?,
-        None => encode(tokenizers, &prompt, &prefix, bos),
+        None => encode(tokenizer, &prompt, &prefix)?,
     };
     let digest = ids.iter().fold(Sha256::new(), |hash, id| {
         hash.chain_update(id.to_le_bytes())
@@ -139,53 +143,25 @@ fn formatter(model: &str, fixture: &Value) -> ChatFormatter {
     formatter.unwrap_or_else(|| panic!("{model}: {error:?}"))
 }
 
-/// The pinned tokenizer without and with the special tokens it adds.
-struct Tokenizers {
-    plain: Tokenizer,
-    specials: Tokenizer,
+/// The pinned tokenizer as hosts load it, when it is in the HF cache; otherwise
+/// say token ids are skipped.
+fn cached_tokenizer(model: &str, revision: &str) -> Option<SglangTokenizer> {
+    SglangTokenizer::load(model, Some(revision))
+        .map_err(|error| eprintln!("{model}@{revision}: {error}: token ids not checked"))
+        .ok()
 }
 
-/// The pinned tokenizer when it is in the HF cache; otherwise say token ids are skipped.
-fn cached_tokenizers(model: &str, revision: &str) -> Option<Tokenizers> {
-    let Some(file) = resolve_tokenizer_file(model, Some(revision)) else {
-        eprintln!("{model}@{revision} is not in the HF cache: token ids not checked");
-        return None;
-    };
-    let load = |specials| load_tokenizer(Some(&file), None, specials).unwrap();
-    Some(Tokenizers {
-        plain: load(false),
-        specials: load(true),
-    })
-}
-
-/// `serving_chat._render_and_encode_chat_template` encodes the prompt without the
-/// tokenizer's own special tokens; `_append_assistant_prefix_to_prompt_ids` encodes
-/// the continuation on its own, with them, minus a leading BOS. Segmented prompts
-/// (Kimi K3) allow special tokens only where the checkpoint's encoder does.
-fn encode(tokenizers: &Tokenizers, prompt: &RenderedPrompt, prefix: &str, bos: &Value) -> Vec<u32> {
-    let mut out = match prompt.encode_segments() {
-        Some(segments) => tokenizers
-            .plain
-            .encode_segments(&segments)
-            .unwrap()
-            .token_ids()
-            .to_vec(),
-        None => tokenizers
-            .plain
-            .encode(prompt.as_str())
-            .unwrap()
-            .token_ids()
-            .to_vec(),
-    };
-    if !prefix.is_empty() {
-        let suffix = tokenizers
-            .specials
-            .encode(prefix)
-            .unwrap()
-            .token_ids()
-            .to_vec();
-        let skip = usize::from(suffix.first().is_some_and(|&id| *bos == id));
-        out.extend(&suffix[skip..]);
-    }
-    out
+/// Segmented prompts (Kimi K3) allow special tokens only where the checkpoint's
+/// encoder does; a text prompt is one segment.
+fn encode(
+    tokenizer: &SglangTokenizer,
+    prompt: &RenderedPrompt,
+    prefix: &str,
+) -> Result<Vec<u32>, String> {
+    let segments = prompt
+        .encode_segments()
+        .unwrap_or_else(|| vec![EncodeSegment::control(prompt.as_str())]);
+    tokenizer
+        .encode_chat(&segments, prefix)
+        .map_err(|error| error.to_string())
 }

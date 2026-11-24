@@ -49,7 +49,7 @@ pub fn load_sglang(
     files: &ModelFiles,
 ) -> Result<(SglangTokenizer, Arc<TokenizerStats>)> {
     let (file, inner, stats) = load_resolved(source, cfg)?;
-    let mut tokenizer = SglangTokenizer::new((*inner).clone(), &file);
+    let mut tokenizer = SglangTokenizer::new((*inner).clone()).with_tokenizer_file(&file);
     if let Ok(Some(config)) = files.json("tokenizer_config.json") {
         tokenizer = tokenizer.with_bos_token(&config);
     }

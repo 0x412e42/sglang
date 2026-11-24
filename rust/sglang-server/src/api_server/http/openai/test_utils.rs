@@ -259,12 +259,18 @@ fn answering_app_state_built(
             abort_hook: None,
         },
     );
-    // The test tokenizers add no specials, so one handle serves both modes.
+    // The test tokenizers add no specials; logprob pieces come from
+    // `tokenizer_path`, as `SglangTokenizer::load` reads them.
+    let tokenizer_json: Option<serde_json::Value> =
+        sglang_processor::resolve_model_file(&server_args.tokenizer_path, None, "tokenizer.json")
+            .and_then(|file| serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok());
     let tokenizer = tokenizer.map(|tokenizer| {
-        Arc::new(sglang_processor::DynamoTokenizer::new(
-            tokenizer.clone(),
-            tokenizer,
-        ))
+        let tokenizer = sglang_processor::SglangTokenizer::new(tokenizer)
+            .with_prompt_affixes(sglang_processor::PromptAffixes::default());
+        Arc::new(match &tokenizer_json {
+            Some(json) => tokenizer.with_token_pieces(json),
+            None => tokenizer,
+        })
     });
     Arc::new(super::AppState {
         core,

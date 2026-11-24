@@ -168,7 +168,7 @@ pub async fn serve(
     // Where a failed startup warmup reports (see `startup_warmup`).
     startup_failure: flume::Sender<String>,
     hicache_manager: Arc<HiCacheManager>,
-    tokenizer: Option<Arc<sglang_processor::DynamoTokenizer>>,
+    tokenizer: Option<Arc<sglang_processor::SglangTokenizer>>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
     let drain = core.clone();

@@ -15,10 +15,23 @@ use dynamo_tokenizers::{
 use serde_json::{Value, json};
 
 use crate::ProcessorError as Error;
+use crate::model_files::{resolve_model_file, resolve_tokenizer_file};
 use crate::token_pieces::TokenPieces;
 
 fn tokenize_error(error: impl Display) -> Error {
     Error::Tokenize(error.to_string())
+}
+
+fn encode_ids(tokenizer: &dyn traits::Tokenizer, text: &str) -> Result<Vec<u32>, Error> {
+    Ok(tokenizer
+        .encode(text)
+        .map_err(tokenize_error)?
+        .token_ids()
+        .to_vec())
+}
+
+fn read_json(file: &str) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()
 }
 
 /// Tokenizer classes whose BOS SGLang restores from `add_bos_token`
@@ -94,15 +107,12 @@ impl PromptAffixes {
             )));
         }
         let plain = create_tokenizer_from_file(tokenizer_file).map_err(tokenize_error)?;
-        let ids = |t: &dyn traits::Tokenizer, text: &str| -> Result<Vec<u32>, Error> {
-            Ok(t.encode(text).map_err(tokenize_error)?.token_ids().to_vec())
-        };
         let special = |key: &str| -> Result<Option<u32>, Error> {
             let config = &tokenizer_config[key];
             let Some(token) = config.as_str().or(config["content"].as_str()) else {
                 return Ok(None);
             };
-            match ids(plain.as_ref(), token)?.as_slice() {
+            match encode_ids(plain.as_ref(), token)?.as_slice() {
                 [id] => Ok(Some(*id)),
                 _ => Err(tokenize_error(format!(
                     "{key} {token:?} is not a single token"
@@ -130,13 +140,27 @@ impl PromptAffixes {
                 eos,
             });
         }
+        Ok(Self {
+            eos,
+            ..Self::from_post_processor(tokenizer_file)?
+        })
+    }
+
+    /// What the `tokenizer.json` post-processor adds around a text: SGLang's
+    /// affixes for every class outside [`BOS_FLAG_CLASSES`], and the closest
+    /// approximation for those [`Self::derive`] refuses.
+    pub fn from_post_processor(tokenizer_file: &str) -> Result<Self, Error> {
+        if !tokenizer_file.ends_with(".json") {
+            return Ok(Self::default());
+        }
         let options = TokenizerOptions {
             add_special_tokens: true,
         };
+        let plain = create_tokenizer_from_file(tokenizer_file).map_err(tokenize_error)?;
         let with_specials = create_tokenizer_from_file_with_options(tokenizer_file, options)
             .map_err(tokenize_error)?;
-        let full = ids(with_specials.as_ref(), "a")?;
-        let bare = ids(plain.as_ref(), "a")?;
+        let full = encode_ids(with_specials.as_ref(), "a")?;
+        let bare = encode_ids(plain.as_ref(), "a")?;
         if bare.is_empty() {
             return Err(tokenize_error("the tokenizer drops the probe text"));
         }
@@ -147,7 +171,7 @@ impl PromptAffixes {
         Ok(Self {
             prefix: full[..start].to_vec(),
             suffix: full[start + bare.len()..].to_vec(),
-            eos,
+            eos: None,
         })
     }
 
@@ -172,15 +196,58 @@ pub struct SglangTokenizer {
 }
 
 impl SglangTokenizer {
-    /// `tokenizer_file` is the file `inner` was loaded from; its kind picks the chunking.
-    pub fn new(inner: Tokenizer, tokenizer_file: &str) -> Self {
+    /// Load the tokenizer at `path` (a tokenizer file, a model dir, or an HF Hub
+    /// repo id resolved from the local cache; no network) with its configs.
+    ///
+    /// Where SGLang's special tokens cannot be reproduced exactly, this falls
+    /// back to the post-processor's, since a server has no engine to defer to.
+    pub fn load(path: &str, revision: Option<&str>) -> Result<Self, String> {
+        let file = resolve_tokenizer_file(path, revision).ok_or_else(|| {
+            format!(
+                "no supported tokenizer file found for '{path}' \
+                 (expected tokenizer.json, tiktoken.model, or *.tiktoken)"
+            )
+        })?;
+        let inner = Tokenizer::from_file(&file)
+            .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
+        let config = |name| resolve_model_file(path, revision, name).and_then(|f| read_json(&f));
+        let tokenizer_config = config("tokenizer_config.json").unwrap_or_default();
+        let model_config = config("config.json").unwrap_or_default();
+        let affixes =
+            PromptAffixes::derive(&file, &tokenizer_config, &model_config).or_else(|error| {
+                tracing::warn!(%path, %error,
+                    "special tokens follow the tokenizer.json post-processor, not SGLang's rule");
+                PromptAffixes::from_post_processor(&file)
+            });
+        let mut tokenizer = Self::new(inner)
+            .with_tokenizer_file(&file)
+            .with_bos_token(&tokenizer_config);
+        if let Some(tokenizer_json) = config("tokenizer.json") {
+            tokenizer = tokenizer.with_token_pieces(&tokenizer_json);
+        }
+        match affixes {
+            Ok(affixes) => tokenizer = tokenizer.with_prompt_affixes(affixes),
+            Err(error) => tracing::error!(%path, %error,
+                "special tokens unknown; encoding with them fails"),
+        }
+        tracing::info!(%path, "loaded tokenizer");
+        Ok(tokenizer)
+    }
+
+    pub fn new(inner: Tokenizer) -> Self {
         Self {
             inner,
-            chunked: !tokenizer_file.ends_with(".json"),
+            chunked: false,
             affixes: None,
             bos: None,
             pieces: None,
         }
+    }
+
+    /// The file `inner` was loaded from; a tiktoken file encodes in chunks.
+    pub fn with_tokenizer_file(mut self, tokenizer_file: &str) -> Self {
+        self.chunked = !tokenizer_file.ends_with(".json");
+        self
     }
 
     pub fn with_prompt_affixes(mut self, affixes: PromptAffixes) -> Self {
@@ -203,12 +270,15 @@ impl SglangTokenizer {
         self
     }
 
+    /// Tiktoken has no vocab lookup, so the token is encoded as a special,
+    /// which must give one id.
     /// Tiktoken has no vocab lookup, so the token must encode to one id.
     fn token_id(&self, token: &str) -> Option<u32> {
         if let Ok(Some(id)) = self.inner.token_to_id(token) {
             return Some(id);
         }
-        match self.inner.encode(token).ok()?.token_ids() {
+        let special = [EncodeSegment::new(token, true)];
+        match self.inner.encode_segments(&special).ok()?.token_ids() {
             &[id] => Some(id),
             _ => None,
         }
@@ -436,6 +506,12 @@ mod tests {
         fn affixes(&self, config: &Value, model: &Value) -> Result<PromptAffixes, Error> {
             PromptAffixes::derive(&self.file(), config, model)
         }
+
+        /// The tokenizer as a server loads it, next to `config` as its `tokenizer_config.json`.
+        fn load(&self, config: &Value) -> SglangTokenizer {
+            std::fs::write(self.0.join("tokenizer_config.json"), config.to_string()).unwrap();
+            SglangTokenizer::load(self.0.to_str().unwrap(), None).unwrap()
+        }
     }
 
     impl Drop for TinyTokenizer {
@@ -513,7 +589,8 @@ mod tests {
         let dir = TinyTokenizer::new(name, Value::Null, Value::Null);
         let file = dir.file();
         let inner = Tokenizer::from_file(&file).unwrap();
-        let tokenizer = SglangTokenizer::new(inner, &file)
+        let tokenizer = SglangTokenizer::new(inner)
+            .with_tokenizer_file(&file)
             .with_prompt_affixes(affixes)
             .with_bos_token(&json!({"bos_token": "<|endoftext|>"}));
         (dir, tokenizer)
@@ -577,9 +654,52 @@ mod tests {
     fn special_tokens_need_known_affixes() {
         let dir = TinyTokenizer::new("unknown", Value::Null, Value::Null);
         let file = dir.file();
-        let tokenizer = SglangTokenizer::new(Tokenizer::from_file(&file).unwrap(), &file);
+        let tokenizer =
+            SglangTokenizer::new(Tokenizer::from_file(&file).unwrap()).with_tokenizer_file(&file);
         assert!(!tokenizer.knows_special_tokens());
         assert!(tokenizer.encode("a", true).is_err());
         assert!(tokenizer.encode("a", false).is_ok());
+    }
+
+    /// DeepSeek-V3's shape: a Llama class whose post-processor adds no BOS.
+    #[test]
+    fn bos_follows_add_bos_token_over_the_post_processor() {
+        let config = json!({"tokenizer_class": "LlamaTokenizerFast", "bos_token": "<|endoftext|>"});
+        let tokenizer = TinyTokenizer::new("bos-flag", Value::Null, Value::Null).load(&config);
+        let bare = tokenizer.encode("a", false).unwrap();
+        assert_eq!(
+            tokenizer.encode("a", true).unwrap(),
+            [&[256], bare.as_slice()].concat()
+        );
+    }
+
+    #[test]
+    fn refused_affixes_fall_back_to_the_post_processor() {
+        let replaced = json!({"type": "Lowercase"});
+        let config = json!({"tokenizer_class": "LlamaTokenizerFast", "add_bos_token": false});
+        let tokenizer = TinyTokenizer::new("fallback", replaced, template()).load(&config);
+        let bare = tokenizer.encode("a", false).unwrap();
+        assert_eq!(
+            tokenizer.encode("a", true).unwrap(),
+            [&[256], bare.as_slice()].concat()
+        );
+    }
+
+    #[test]
+    fn special_tokens_wrap_a_segmented_prompt_once() {
+        let (_dir, tokenizer) = tiny(
+            "segments-once",
+            PromptAffixes {
+                prefix: vec![256],
+                suffix: vec![256],
+                eos: None,
+            },
+        );
+        let segments = [EncodeSegment::control("a"), EncodeSegment::control("b")];
+        let bare = tokenizer.encode_segments(&segments, false).unwrap();
+        assert_eq!(
+            tokenizer.encode_segments(&segments, true).unwrap(),
+            [&[256], bare.as_slice(), &[256]].concat()
+        );
     }
 }

@@ -431,7 +431,7 @@ impl TokenizerRegistry {
 #[cfg(test)]
 pub(crate) fn sglang_for_test(source: &str) -> SglangTokenizer {
     let tokenizer = adapter::load(source).expect("test tokenizer loads");
-    SglangTokenizer::new((*tokenizer).clone(), source)
+    SglangTokenizer::new((*tokenizer).clone()).with_tokenizer_file(source)
 }
 
 #[cfg(test)]

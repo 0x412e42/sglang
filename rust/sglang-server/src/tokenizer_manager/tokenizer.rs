@@ -3,7 +3,7 @@
 //! fills `input_ids`, and moves the request back to the TokenizerManager inbox.
 //!
 //! The text→ids step is `sglang_processor`'s [`TextTokenizer`], implemented by
-//! [`DynamoTokenizer`] (dynamo-tokenizers: HuggingFace / tiktoken / fastokens).
+//! [`SglangTokenizer`] (dynamo-tokenizers: HuggingFace / tiktoken / fastokens).
 //! A non-skip server requires a real tokenizer (enforced at startup); under
 //! `skip_tokenizer_init` the pool isn't spawned at all.
 //!
@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use sglang_processor::{DynamoTokenizer, ProcessorError, TextTokenizer};
+use sglang_processor::{ProcessorError, SglangTokenizer, TextTokenizer};
 
 use crate::message::request::{Request, RequestKind, TokenizeInput};
 use crate::message::response::ResponseItem;
@@ -30,7 +30,7 @@ pub fn load_tokenizer(
     tokenizer_path: Option<&str>,
     revision: Option<&str>,
     skip_tokenizer_init: bool,
-) -> Result<Option<DynamoTokenizer>, String> {
+) -> Result<Option<SglangTokenizer>, String> {
     if skip_tokenizer_init {
         tracing::info!("skip_tokenizer_init: token ids in and out; no tokenizer/detokenizer");
         return Ok(None);
@@ -38,7 +38,7 @@ pub fn load_tokenizer(
     let path = tokenizer_path.ok_or_else(|| {
         "no tokenizer configured: set tokenizer_path or enable skip_tokenizer_init".to_string()
     })?;
-    DynamoTokenizer::load(path, revision).map(Some)
+    SglangTokenizer::load(path, revision).map(Some)
 }
 
 /// Widened once here, in the parallel pool: the scheduler's `array("q")` is
